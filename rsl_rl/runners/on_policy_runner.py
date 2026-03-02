@@ -8,13 +8,138 @@ import statistics
 import time
 import torch
 from collections import deque
+from importlib import import_module
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
-from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
+
+# 确保使用本地的 ActorCritic 和 PPO 类（通过文件系统路径直接导入）
+# 这样可以避免被 Isaac Lab 的版本覆盖
+import importlib.util
+import sys
+
+# 获取当前文件的目录
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取 rsl_rl 模块的根目录（当前文件在 rsl_rl/runners/ 下，所以上一级就是 rsl_rl）
+_rsl_rl_root = os.path.dirname(_current_dir)
+# 将 rsl_rl 根目录添加到 sys.path，确保依赖项能正确导入
+if _rsl_rl_root not in sys.path:
+    sys.path.insert(0, _rsl_rl_root)
+
+# 直接导入本地的 ActorCritic 类
+_actor_critic_path = os.path.join(_rsl_rl_root, "modules", "actor_critic.py")
+_actor_critic_recurrent_path = os.path.join(_rsl_rl_root, "modules", "actor_critic_recurrent.py")
+
+# 导入 ActorCritic（需要先导入，因为 ActorCriticRecurrent 依赖它）
+spec = importlib.util.spec_from_file_location("rsl_rl.modules.actor_critic", _actor_critic_path)
+local_actor_critic_module = importlib.util.module_from_spec(spec)
+# 设置模块的 __package__ 和 __name__，确保相对导入能正常工作
+local_actor_critic_module.__package__ = "rsl_rl.modules"
+local_actor_critic_module.__name__ = "rsl_rl.modules.actor_critic"
+# 在执行模块之前，先将其注册到 sys.modules，这样其他模块导入时会使用这个版本
+sys.modules["rsl_rl.modules.actor_critic"] = local_actor_critic_module
+spec.loader.exec_module(local_actor_critic_module)
+LocalActorCritic = local_actor_critic_module.ActorCritic
+
+# 确保 rsl_rl.modules 也在 sys.modules 中
+if "rsl_rl.modules" not in sys.modules:
+    import types
+    sys.modules["rsl_rl.modules"] = types.ModuleType("rsl_rl.modules")
+    sys.modules["rsl_rl.modules"].__path__ = [os.path.join(_rsl_rl_root, "modules")]
+
+# 导入 ActorCriticRecurrent（依赖 ActorCritic）
+spec = importlib.util.spec_from_file_location("rsl_rl.modules.actor_critic_recurrent", _actor_critic_recurrent_path)
+local_actor_critic_recurrent_module = importlib.util.module_from_spec(spec)
+# 设置模块属性，确保依赖项能正确导入
+local_actor_critic_recurrent_module.__package__ = "rsl_rl.modules"
+local_actor_critic_recurrent_module.__name__ = "rsl_rl.modules.actor_critic_recurrent"
+# 在执行模块之前，先将其注册到 sys.modules
+sys.modules["rsl_rl.modules.actor_critic_recurrent"] = local_actor_critic_recurrent_module
+# 导入 unpad_trajectories（从 rsl_rl.utils）
+try:
+    from rsl_rl.utils import unpad_trajectories
+except ImportError:
+    # 如果导入失败，尝试从文件系统导入
+    _utils_path = os.path.join(_rsl_rl_root, "utils", "__init__.py")
+    if os.path.exists(_utils_path):
+        spec_utils = importlib.util.spec_from_file_location("rsl_rl.utils", _utils_path)
+        utils_module = importlib.util.module_from_spec(spec_utils)
+        utils_module.__package__ = "rsl_rl.utils"
+        utils_module.__name__ = "rsl_rl.utils"
+        sys.modules["rsl_rl.utils"] = utils_module
+        spec_utils.loader.exec_module(utils_module)
+        unpad_trajectories = utils_module.unpad_trajectories
+
+spec.loader.exec_module(local_actor_critic_recurrent_module)
+LocalActorCriticRecurrent = local_actor_critic_recurrent_module.ActorCriticRecurrent
+
+# 确保使用本地的 RolloutStorage 类（通过文件系统路径直接导入）
+# 先创建 rsl_rl.storage 包模块
+if "rsl_rl.storage" not in sys.modules:
+    import types
+    storage_pkg = types.ModuleType("rsl_rl.storage")
+    storage_pkg.__path__ = [os.path.join(_rsl_rl_root, "storage")]
+    sys.modules["rsl_rl.storage"] = storage_pkg
+
+_storage_path = os.path.join(_rsl_rl_root, "storage", "rollout_storage.py")
+spec_storage = importlib.util.spec_from_file_location("rsl_rl.storage.rollout_storage", _storage_path)
+storage_module = importlib.util.module_from_spec(spec_storage)
+storage_module.__package__ = "rsl_rl.storage"
+storage_module.__name__ = "rsl_rl.storage.rollout_storage"
+# 设置依赖项
+try:
+    from rsl_rl.utils import split_and_pad_trajectories
+    storage_module.split_and_pad_trajectories = split_and_pad_trajectories
+except ImportError:
+    # 如果导入失败，尝试从文件系统导入
+    _utils_path = os.path.join(_rsl_rl_root, "utils", "__init__.py")
+    if os.path.exists(_utils_path):
+        spec_utils = importlib.util.spec_from_file_location("rsl_rl.utils", _utils_path)
+        utils_module = importlib.util.module_from_spec(spec_utils)
+        utils_module.__package__ = "rsl_rl.utils"
+        utils_module.__name__ = "rsl_rl.utils"
+        if "rsl_rl.utils" not in sys.modules:
+            sys.modules["rsl_rl.utils"] = utils_module
+        spec_utils.loader.exec_module(utils_module)
+        storage_module.split_and_pad_trajectories = utils_module.split_and_pad_trajectories
+# 在执行模块之前，先将其注册到 sys.modules，这样其他模块导入时会使用这个版本
+sys.modules["rsl_rl.storage.rollout_storage"] = storage_module
+spec_storage.loader.exec_module(storage_module)
+LocalRolloutStorage = storage_module.RolloutStorage
+# 确保 rsl_rl.storage 包也能导出 RolloutStorage（这样 from rsl_rl.storage import RolloutStorage 才能工作）
+sys.modules["rsl_rl.storage"].RolloutStorage = LocalRolloutStorage
+# 同时确保 rsl_rl.storage.__init__ 也能导出（模拟 __init__.py 的行为）
+_storage_init_path = os.path.join(_rsl_rl_root, "storage", "__init__.py")
+if os.path.exists(_storage_init_path):
+    spec_storage_init = importlib.util.spec_from_file_location("rsl_rl.storage", _storage_init_path)
+    storage_init_module = importlib.util.module_from_spec(spec_storage_init)
+    storage_init_module.__package__ = "rsl_rl.storage"
+    storage_init_module.__name__ = "rsl_rl.storage"
+    storage_init_module.RolloutStorage = LocalRolloutStorage
+    sys.modules["rsl_rl.storage"] = storage_init_module
+    spec_storage_init.loader.exec_module(storage_init_module)
+
+# 确保使用本地的 PPO 类（通过文件系统路径直接导入）
+# PPO 依赖 ActorCritic 和 RolloutStorage
+_ppo_path = os.path.join(_rsl_rl_root, "algorithms", "ppo.py")
+spec_ppo = importlib.util.spec_from_file_location("rsl_rl.algorithms.ppo", _ppo_path)
+ppo_module = importlib.util.module_from_spec(spec_ppo)
+ppo_module.__package__ = "rsl_rl.algorithms"
+ppo_module.__name__ = "rsl_rl.algorithms.ppo"
+# 设置依赖项
+ppo_module.ActorCritic = LocalActorCritic
+ppo_module.RolloutStorage = LocalRolloutStorage
+# 在执行模块之前，先将其注册到 sys.modules
+if "rsl_rl.algorithms" not in sys.modules:
+    import types
+    sys.modules["rsl_rl.algorithms"] = types.ModuleType("rsl_rl.algorithms")
+    sys.modules["rsl_rl.algorithms"].__path__ = [os.path.join(_rsl_rl_root, "algorithms")]
+sys.modules["rsl_rl.algorithms.ppo"] = ppo_module
+spec_ppo.loader.exec_module(ppo_module)
+PPO = ppo_module.PPO
 
 
 class OnPolicyRunner:
@@ -24,20 +149,116 @@ class OnPolicyRunner:
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+        # 从顶层配置中提取 use_tanh_output（如果存在）
+        # 这个参数可能在配置类的顶层，而不是在 policy_cfg 中
+        self.use_tanh_output = train_cfg.get("use_tanh_output", False)
         self.device = device
         self.env = env
         obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
-        else:
-            num_critic_obs = num_obs
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
-            num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
+        # Build per-group observation tensors expected by ActorCritic API
+        policy_obs_tensor = extras["observations"].get("policy", obs)
+        critic_obs_tensor = extras["observations"].get("critic", policy_obs_tensor)
+        num_obs = policy_obs_tensor.shape[1]
+        num_critic_obs = critic_obs_tensor.shape[1]
+
+        # Resolve obs_groups from policy cfg, with a safe default
+        obs_groups_cfg = self.policy_cfg.get("obs_groups")
+        if not isinstance(obs_groups_cfg, dict):
+            obs_groups_cfg = {"policy": ["policy"], "critic": ["critic"]}
+        # Remove obs_groups from kwargs passed to the network constructor
+        if "obs_groups" in self.policy_cfg:
+            self.policy_cfg.pop("obs_groups")
+
+        # Construct ActorCritic with correct parameters
+        # ActorCritic expects: (num_actor_obs, num_critic_obs, num_actions, **kwargs)
+        # 确保使用本地的 ActorCritic 类，而不是通过 eval() 解析（可能解析到 Isaac Lab 的版本）
+        class_name = self.policy_cfg.pop("class_name", "ActorCritic")
+        
+        # 处理可能的完整模块路径（如 "rsl_rl.modules.ActorCritic" 或 "ActorCritic"）
+        # 提取类名（最后一个点后的部分）
+        if "." in class_name:
+            class_name = class_name.split(".")[-1]
+        
+        # 验证本地 ActorCritic 类是否正确（检查签名）
+        import inspect
+        local_actor_critic_sig = inspect.signature(LocalActorCritic.__init__)
+        local_params = set(local_actor_critic_sig.parameters.keys()) - {"self"}
+        if "obs" in local_params or "obs_groups" in local_params:
+            raise RuntimeError(
+                f"错误：本地的 ActorCritic 类签名不正确！\n"
+                f"本地的 ActorCritic 需要 'obs' 和 'obs_groups' 参数，这是不应该的。\n"
+                f"当前签名: {local_actor_critic_sig}"
+            )
+        
+        # 使用本地的 ActorCritic 类映射（通过绝对导入路径）
+        actor_critic_class_map = {
+            "ActorCritic": LocalActorCritic,
+            "ActorCriticRecurrent": LocalActorCriticRecurrent,
+        }
+        if class_name not in actor_critic_class_map:
+            print(f"[WARNING] 未知的 ActorCritic 类名: {class_name}，使用默认的 ActorCritic")
+            print(f"[WARNING] 支持的类名: {list(actor_critic_class_map.keys())}")
+            class_name = "ActorCritic"  # 使用默认值
+        
+        # 强制使用本地的 ActorCritic 类，忽略配置中的 class_name
+        # 这样可以确保始终使用正确的类，即使配置指向了错误的类
+        actor_critic_class = LocalActorCritic
+        print(f"[INFO] 使用本地的 ActorCritic 类（忽略配置中的 class_name: {class_name}）")
+        
+        # Extract observation dimensions
+        num_actor_obs = policy_obs_tensor.shape[1]
+        num_critic_obs = critic_obs_tensor.shape[1]
+        
+        # 从 policy_cfg 或顶层配置中提取 use_tanh_output（如果存在）
+        # 注意：RslRlPpoActorCriticCfg 可能不支持这个参数，所以我们需要手动提取
+        # 首先尝试从 policy_cfg 中获取，如果没有则使用顶层配置中的值
+        use_tanh_output = self.policy_cfg.pop("use_tanh_output", self.use_tanh_output)
+        
+        # Create ActorCritic with correct parameter order
+        actor_critic: LocalActorCritic | LocalActorCriticRecurrent = actor_critic_class(
+            num_actor_obs=num_actor_obs,
+            num_critic_obs=num_critic_obs,
+            num_actions=self.env.num_actions,
+            use_tanh_output=use_tanh_output,  # 显式传递 use_tanh_output
+            **self.policy_cfg  # 传递其他配置参数
         ).to(self.device)
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        # 确保使用本地的 PPO 类，而不是通过 eval() 解析（可能解析到 Isaac Lab 的版本）
+        class_name = self.alg_cfg.pop("class_name", "PPO")
+        # 处理可能的完整模块路径
+        if "." in class_name:
+            class_name = class_name.split(".")[-1]
+        
+        # 强制使用本地的 PPO 类，忽略配置中的 class_name
+        alg_class = PPO
+        print(f"[INFO] 使用本地的 PPO 类（忽略配置中的 class_name: {class_name}）")
+        
+        # 验证 PPO 类的 init_storage 方法签名
+        import inspect
+        init_storage_sig = inspect.signature(alg_class.init_storage)
+        init_storage_params = set(init_storage_sig.parameters.keys()) - {"self"}
+        if "actor_obs_shape" not in init_storage_params:
+            raise RuntimeError(
+                f"错误：导入的 PPO 类 init_storage 方法签名不正确！\n"
+                f"本地的 PPO.init_storage 应该接受 'actor_obs_shape' 参数，但当前签名是: {init_storage_sig}\n"
+                f"这可能意味着导入的是 Isaac Lab 的 PPO 版本。"
+            )
+        
+        # Filter out unsupported parameters from alg_cfg
+        # Get the signature of PPO.__init__ to know which parameters are supported
+        ppo_init_signature = inspect.signature(alg_class.__init__)
+        supported_params = set(ppo_init_signature.parameters.keys())
+        # Remove 'self' from supported params
+        supported_params.discard('self')
+        
+        # Filter alg_cfg to only include supported parameters
+        filtered_alg_cfg = {k: v for k, v in self.alg_cfg.items() if k in supported_params}
+        
+        # Warn about unsupported parameters
+        unsupported_params = set(self.alg_cfg.keys()) - supported_params
+        if unsupported_params:
+            print(f"[WARNING] PPO不支持以下参数，将被忽略: {unsupported_params}")
+        
+        self.alg: PPO = alg_class(actor_critic, device=self.device, **filtered_alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -48,12 +269,18 @@ class OnPolicyRunner:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.critic_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
         # init storage and model
+        # PPO.init_storage expects: (num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape)
+        # Extract observation shapes (remove batch dimension)
+        actor_obs_shape = policy_obs_tensor.shape[1:]  # Remove batch dimension, keep feature dimensions
+        critic_obs_shape = critic_obs_tensor.shape[1:]  # Remove batch dimension, keep feature dimensions
+        action_shape = (self.env.num_actions,)  # Action shape as tuple
+        
         self.alg.init_storage(
-            self.env.num_envs,
-            self.num_steps_per_env,
-            [num_obs],
-            [num_critic_obs],
-            [self.env.num_actions],
+            num_envs=self.env.num_envs,
+            num_transitions_per_env=self.num_steps_per_env,
+            actor_obs_shape=actor_obs_shape,
+            critic_obs_shape=critic_obs_shape,
+            action_shape=action_shape,
         )
 
         # Log
@@ -90,9 +317,11 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
-        critic_obs = extras["observations"].get("critic", obs)
-        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        obs_tensor, extras = self.env.get_observations()
+        # build initial dict observation
+        policy_obs = extras["observations"].get("policy", obs_tensor)
+        critic_obs = extras["observations"].get("critic", policy_obs)
+        obs = {"policy": policy_obs.to(self.device), "critic": critic_obs.to(self.device)}
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -108,22 +337,24 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs)
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    # move to the right device
-                    obs, critic_obs, rewards, dones = (
-                        obs.to(self.device),
-                        critic_obs.to(self.device),
-                        rewards.to(self.device),
-                        dones.to(self.device),
-                    )
-                    # perform normalization
-                    obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
-                    else:
-                        critic_obs = obs
-                    # process the step
+                    # Extract policy and critic observations from dict
+                    policy_obs_tensor = obs["policy"]
+                    critic_obs_tensor = obs["critic"]
+                    # PPO.act() expects (obs, critic_obs) as separate tensor arguments
+                    actions = self.alg.act(policy_obs_tensor, critic_obs_tensor)
+                    
+                    # 调试：打印的是策略网络原始输出（未限幅）；限幅在 CartControlAction.process_actions 中做，实际控制用的是限幅后的值
+                    if i == 0 and actions.shape[-1] >= 14 and it % 1 == 0:
+                        a0 = actions[0, :14].detach().cpu().numpy()
+                        print(f"[train] iter={it} step0 env0 action(14) [raw policy]: {a0.tolist()}")
+                    
+                    obs_tensor, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    # rebuild dict observation from infos
+                    policy_obs = infos.get("observations", {}).get("policy", obs_tensor)
+                    critic_obs = infos.get("observations", {}).get("critic", policy_obs)
+                    obs = {"policy": policy_obs.to(self.device), "critic": critic_obs.to(self.device)}
+                    rewards, dones = rewards.to(self.device), dones.to(self.device)
+                    # process the step - PPO.process_env_step expects (rewards, dones, infos)
                     self.alg.process_env_step(rewards, dones, infos)
 
                     if self.log_dir is not None:
@@ -147,12 +378,106 @@ class OnPolicyRunner:
 
                 # Learning step
                 start = stop
-                self.alg.compute_returns(critic_obs)
+                # compute_returns expects last_critic_obs as a tensor
+                last_critic_obs = obs["critic"]
+                self.alg.compute_returns(last_critic_obs)
 
-            mean_value_loss, mean_surrogate_loss = self.alg.update()
+            # PPO.update() returns (mean_value_loss, mean_surrogate_loss, mean_entropy) tuple
+            mean_value_loss, mean_surrogate_loss, mean_entropy = self.alg.update()
+            # Convert to dict format expected by log() method
+            loss_dict = {
+                "value_function": mean_value_loss,
+                "surrogate": mean_surrogate_loss,
+                "entropy": mean_entropy,
+            }
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+            # 将当前 learning iteration 和 mean_episode_length 存储到环境对象，供课程学习使用
+            # 计算最近完成的episode的平均长度（与 Train/mean_episode_length 一致）
+            if len(lenbuffer) > 0:
+                mean_ep_len = statistics.mean(lenbuffer)
+            else:
+                mean_ep_len = 0.0
+            if hasattr(self.env, 'unwrapped'):
+                self.env.unwrapped.current_learning_iteration = it
+                self.env.unwrapped.mean_episode_length = mean_ep_len
+                self.env.unwrapped.num_steps_per_env = self.num_steps_per_env  # 存储rollout长度（用于EMA alpha计算）
+            else:
+                self.env.current_learning_iteration = it
+                self.env.mean_episode_length = mean_ep_len
+                self.env.num_steps_per_env = self.num_steps_per_env  # 存储rollout长度（用于EMA alpha计算）
+            
+            # 在每个iteration结束时更新课程学习的progress
+            # 这符合"课程学习 update 在 iteration，apply 在 reset"的设计原则
+            # 根据环境配置自动确定正确的任务模块路径
+            curriculum_updated = False
+            env_obj = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            
+            # 方法1：从环境配置类的模块路径推断任务模块
+            # 例如：isaacLab.manipulation.tasks.Cart_simplehands.cart_control.cart_control_env_cfg
+            # 提取任务名称：Cart_simplehands
+            task_module_path = None
+            if hasattr(env_obj, 'cfg') and hasattr(env_obj.cfg, '__class__'):
+                cfg_module = env_obj.cfg.__class__.__module__
+                # 从模块路径中提取任务名称
+                # 例如：isaacLab.manipulation.tasks.Cart_simplehands.cart_control.cart_control_env_cfg
+                # 提取：Cart_simplehands
+                if 'tasks.' in cfg_module:
+                    parts = cfg_module.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'tasks' and i + 1 < len(parts):
+                            task_name = parts[i + 1]  # 例如：Cart_simplehands
+                            # 构建课程学习模块路径
+                            task_module_path = f"isaacLab.manipulation.tasks.{task_name}.cart_control.mdp.curriculums"
+                            break
+            
+            # 方法2：如果方法1失败，尝试从已知的任务模块列表中查找
+            if task_module_path is None:
+                # 尝试从多个可能的路径导入课程学习函数（支持不同的任务变体）
+                task_modules = [
+                    "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
+                    "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
+                    "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
+                ]
+            else:
+                # 优先使用从配置推断的模块路径，然后尝试其他路径作为备选
+                task_modules = [task_module_path] + [
+                    "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
+                    "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
+                    "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
+                ]
+                # 去重，保持顺序
+                seen = set()
+                unique_task_modules = []
+                for m in task_modules:
+                    if m not in seen:
+                        seen.add(m)
+                        unique_task_modules.append(m)
+                task_modules = unique_task_modules
+            
+            # 尝试导入课程学习函数
+            for task_module in task_modules:
+                try:
+                    curriculums_module = import_module(task_module)
+                    if hasattr(curriculums_module, 'update_curriculum_progress_per_iteration'):
+                        update_curriculum_progress_per_iteration = getattr(curriculums_module, 'update_curriculum_progress_per_iteration')
+                        update_curriculum_progress_per_iteration(env_obj)
+                        curriculum_updated = True
+                        break
+                except (ImportError, AttributeError, ModuleNotFoundError):
+                    continue
+            
+            # 方法3：如果所有路径都失败，尝试通用导入（向后兼容）
+            if not curriculum_updated:
+                try:
+                    from isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums import update_curriculum_progress_per_iteration
+                    update_curriculum_progress_per_iteration(env_obj)
+                    curriculum_updated = True
+                except (ImportError, AttributeError, ModuleNotFoundError):
+                    # 如果课程学习函数不存在，跳过（兼容其他任务）
+                    pass
+            
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
@@ -172,6 +497,12 @@ class OnPolicyRunner:
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
+
+        # losses from latest PPO.update()
+        loss_dict = locs.get("loss_dict", {})
+        value_loss_v = loss_dict.get("value_function")
+        surrogate_loss_v = loss_dict.get("surrogate")
+        entropy_v = loss_dict.get("entropy")
 
         ep_string = ""
         if locs["ep_infos"]:
@@ -194,11 +525,17 @@ class OnPolicyRunner:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        mean_std = self.alg.actor_critic.std.mean()
+        # Compatible with latest PPO API where network is stored as `policy`
+        ac_module = getattr(self.alg, "policy", None) or getattr(self.alg, "actor_critic", None)
+        mean_std = ac_module.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
-        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+        if value_loss_v is not None:
+            self.writer.add_scalar("Loss/value_function", value_loss_v, locs["it"])
+        if surrogate_loss_v is not None:
+            self.writer.add_scalar("Loss/surrogate", surrogate_loss_v, locs["it"])
+        if entropy_v is not None:
+            self.writer.add_scalar("Loss/entropy", entropy_v, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -213,16 +550,17 @@ class OnPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+        header_str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["rewbuffer"]) > 0:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
+                f"""{header_str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Value function loss:':>{pad}} {value_loss_v if value_loss_v is not None else float('nan'):.4f}\n"""
+                f"""{'Surrogate loss:':>{pad}} {surrogate_loss_v if surrogate_loss_v is not None else float('nan'):.4f}\n"""
+                f"""{'Entropy:':>{pad}} {entropy_v if entropy_v is not None else float('nan'):.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
@@ -232,11 +570,12 @@ class OnPolicyRunner:
         else:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
+                f"""{header_str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Value function loss:':>{pad}} {value_loss_v if value_loss_v is not None else float('nan'):.4f}\n"""
+                f"""{'Surrogate loss:':>{pad}} {surrogate_loss_v if surrogate_loss_v is not None else float('nan'):.4f}\n"""
+                f"""{'Entropy:':>{pad}} {entropy_v if entropy_v is not None else float('nan'):.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
@@ -254,8 +593,10 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path, infos=None):
+        # Resolve actor-critic module (compat between newer/older PPO APIs)
+        ac_module = getattr(self.alg, "policy", None) or getattr(self.alg, "actor_critic", None)
         saved_dict = {
-            "model_state_dict": self.alg.actor_critic.state_dict(),
+            "model_state_dict": ac_module.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
@@ -270,11 +611,13 @@ class OnPolicyRunner:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path)
-        self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+        loaded_dict = torch.load(path, weights_only=False)  # weights_only=False for compatibility with older checkpoints
+        ac_module = getattr(self.alg, "policy", None) or getattr(self.alg, "actor_critic", None)
+        ac_module.load_state_dict(loaded_dict["model_state_dict"]) 
         if self.empirical_normalization:
-            self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-            self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
+            # 使用 strict=False 来忽略不匹配的键（如 "count"），因为推理时不需要这些统计信息
+            self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"], strict=False)
+            self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"], strict=False)
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         self.current_learning_iteration = loaded_dict["iter"]
@@ -282,23 +625,39 @@ class OnPolicyRunner:
 
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
+        ac_module = getattr(self.alg, "policy", None) or getattr(self.alg, "actor_critic", None)
         if device is not None:
-            self.alg.actor_critic.to(device)
-        policy = self.alg.actor_critic.act_inference
+            ac_module.to(device)
+        policy = ac_module.act_inference
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.actor_critic.act_inference(self.obs_normalizer(x))  # noqa: E731
+            # 归一化只应用于policy观察（张量），而不是整个字典
+            # act_inference期望接收字典格式的观察
+            def normalized_policy(obs_dict):
+                if isinstance(obs_dict, dict):
+                    # 归一化policy观察
+                    normalized_policy_obs = self.obs_normalizer(obs_dict["policy"])
+                    # 构建新的字典，保持critic观察不变（如果需要归一化critic，应该使用critic_obs_normalizer）
+                    normalized_obs = {"policy": normalized_policy_obs}
+                    if "critic" in obs_dict:
+                        normalized_obs["critic"] = obs_dict["critic"]
+                    return ac_module.act_inference(normalized_obs)
+                else:
+                    # 如果传入的是张量（向后兼容）
+                    return ac_module.act_inference(self.obs_normalizer(obs_dict))
+            policy = normalized_policy
         return policy
 
     def train_mode(self):
-        self.alg.actor_critic.train()
+        # Align with latest PPO API which stores network in `policy`
+        (getattr(self.alg, "policy", None) or self.alg.actor_critic).train()
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.critic_obs_normalizer.train()
 
     def eval_mode(self):
-        self.alg.actor_critic.eval()
+        (getattr(self.alg, "policy", None) or self.alg.actor_critic).eval()
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()

@@ -32,6 +32,9 @@ class ActorCriticRecurrent(ActorCritic):
                 "ActorCriticRecurrent.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
 
+        # 从kwargs中提取use_tanh_output（如果存在）
+        use_tanh_output = kwargs.pop("use_tanh_output", False)
+        
         super().__init__(
             num_actor_obs=rnn_hidden_size,
             num_critic_obs=rnn_hidden_size,
@@ -40,6 +43,7 @@ class ActorCriticRecurrent(ActorCritic):
             critic_hidden_dims=critic_hidden_dims,
             activation=activation,
             init_noise_std=init_noise_std,
+            use_tanh_output=use_tanh_output,
         )
 
         activation = get_activation(activation)

@@ -101,6 +101,7 @@ class PPO:
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_entropy = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -167,19 +168,91 @@ class PPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            
+            # 检查 loss 本身是否有 NaN/Inf，如果有则跳过这次更新
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[WARNING] 检测到 loss 有 NaN 或 Inf 值，跳过这次梯度更新！")
+                print(f"[WARNING] surrogate_loss={surrogate_loss.item()}, value_loss={value_loss.item()}, entropy_mean={entropy_batch.mean().item()}")
+                # 跳过梯度更新，但继续累积统计信息
+                mean_value_loss += value_loss.item() if not (torch.isnan(value_loss) or torch.isinf(value_loss)) else 0.0
+                mean_surrogate_loss += surrogate_loss.item() if not (torch.isnan(surrogate_loss) or torch.isinf(surrogate_loss)) else 0.0
+                entropy_mean = entropy_batch.mean()
+                if torch.isnan(entropy_mean) or torch.isinf(entropy_mean):
+                    entropy_mean = torch.tensor(0.0, device=self.device)
+                mean_entropy += entropy_mean.item()
+                continue  # 跳过这次更新
 
+            # 在梯度更新前，先检查并修复 std 参数的异常值（防止梯度更新导致 NaN/Inf）
+            if hasattr(self.actor_critic, 'std'):
+                std_param = self.actor_critic.std
+                # 检查是否有 NaN 或 Inf
+                if torch.any(torch.isnan(std_param)) or torch.any(torch.isinf(std_param)):
+                    print(f"[WARNING] 梯度更新前检测到 std 参数有 NaN 或 Inf 值，正在修复...")
+                    with torch.no_grad():
+                        # 重置为安全的默认值
+                        std_param.data = torch.where(
+                            torch.isnan(std_param.data) | torch.isinf(std_param.data),
+                            torch.full_like(std_param.data, -1.0),  # 默认 log_std = -1.0
+                            std_param.data
+                        )
+                        # 限制范围
+                        std_param.data = torch.clamp(std_param.data, min=-4.0, max=0.5)
+            
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+            
+            # 检查梯度是否有 NaN/Inf
+            has_nan_grad = False
+            for param in self.actor_critic.parameters():
+                if param.grad is not None:
+                    if torch.any(torch.isnan(param.grad)) or torch.any(torch.isinf(param.grad)):
+                        print(f"[WARNING] 检测到参数梯度有 NaN 或 Inf 值，清零该梯度！")
+                        param.grad.zero_()
+                        has_nan_grad = True
+            
+            if has_nan_grad:
+                print(f"[WARNING] 检测到 NaN/Inf 梯度，跳过这次参数更新！")
+                # 跳过参数更新，但继续累积统计信息
+                mean_value_loss += value_loss.item() if not (torch.isnan(value_loss) or torch.isinf(value_loss)) else 0.0
+                mean_surrogate_loss += surrogate_loss.item() if not (torch.isnan(surrogate_loss) or torch.isinf(surrogate_loss)) else 0.0
+                entropy_mean = entropy_batch.mean()
+                if torch.isnan(entropy_mean) or torch.isinf(entropy_mean):
+                    entropy_mean = torch.tensor(0.0, device=self.device)
+                mean_entropy += entropy_mean.item()
+                continue  # 跳过这次更新
+            
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            
+            # 参数更新后，再次检查并修复 std 参数的异常值（双重保险）
+            if hasattr(self.actor_critic, 'std'):
+                std_param = self.actor_critic.std
+                # 检查是否有 NaN 或 Inf
+                if torch.any(torch.isnan(std_param)) or torch.any(torch.isinf(std_param)):
+                    print(f"[WARNING] 梯度更新后检测到 std 参数有 NaN 或 Inf 值，正在修复...")
+                    with torch.no_grad():
+                        # 重置为安全的默认值
+                        std_param.data = torch.where(
+                            torch.isnan(std_param.data) | torch.isinf(std_param.data),
+                            torch.full_like(std_param.data, -1.0),  # 默认 log_std = -1.0
+                            std_param.data
+                        )
+                        # 限制范围
+                        std_param.data = torch.clamp(std_param.data, min=-4.0, max=0.5)
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            # Calculate mean entropy (handle NaN values)
+            entropy_mean = entropy_batch.mean()
+            if torch.isnan(entropy_mean) or torch.isinf(entropy_mean):
+                entropy_mean = torch.tensor(0.0, device=self.device)
+            mean_entropy += entropy_mean.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_entropy /= num_updates
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss, mean_surrogate_loss, mean_entropy
