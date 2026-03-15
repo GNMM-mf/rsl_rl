@@ -142,6 +142,62 @@ spec_ppo.loader.exec_module(ppo_module)
 PPO = ppo_module.PPO
 
 
+def _ensure_obs_tensor(obs, role_key: str, fallback: torch.Tensor = None):
+    """从 dict/TensorDict/张量 中按 role_key 取出观测张量，保证 critic 不用 policy 的张量。
+    role_key: "policy" 或 "critic"
+    """
+    if obs is None:
+        return fallback
+    if isinstance(obs, torch.Tensor) and obs.numel() > 0 and len(obs.shape) >= 2:
+        return obs
+    if hasattr(obs, "get") and role_key in obs:
+        val = obs[role_key]
+        if isinstance(val, torch.Tensor) and val.numel() > 0 and len(val.shape) >= 2:
+            return val
+    if hasattr(obs, "keys"):
+        for k in ("observations", "obs", "observation", "state"):
+            if k in obs:
+                sub = obs[k]
+                if hasattr(sub, "get") and role_key in sub:
+                    v = sub[role_key]
+                    if isinstance(v, torch.Tensor) and v.numel() > 0 and len(v.shape) >= 2:
+                        return v
+    return fallback
+
+
+def _get_policy_critic_obs(env, get_observations_returns_dict: bool = None):
+    """统一从环境获取 policy 与 critic 观测，保证两者按 key 区分，避免 critic 误用 policy 张量。
+    兼容两种 API：(1) get_observations() 返回 dict 且含 "policy"/"critic"；
+    (2) 返回 (obs, extras) 且 extras["observations"] 含 "policy"/"critic"。
+    返回 (policy_obs_tensor, critic_obs_tensor)，均为 2D tensor。
+    """
+    out = env.get_observations()
+    policy_fallback = None
+    critic_fallback = None
+    obs_for_keys = None
+
+    if isinstance(out, dict):
+        policy_fallback = out.get("policy")
+        critic_fallback = out.get("critic", out.get("policy"))
+        obs_for_keys = out
+    else:
+        obs_tensor, extras = out
+        policy_fallback = obs_tensor
+        critic_fallback = obs_tensor
+        if isinstance(extras, dict) and "observations" in extras:
+            obs_for_keys = extras["observations"]
+
+    policy_obs = _ensure_obs_tensor(obs_for_keys, "policy", policy_fallback)
+    critic_obs = _ensure_obs_tensor(obs_for_keys, "critic", critic_fallback)
+    if policy_obs is None:
+        policy_obs = policy_fallback
+    if critic_obs is None:
+        critic_obs = critic_fallback
+    if policy_obs is None or critic_obs is None:
+        raise RuntimeError("critic 张量不应使用 policy 的：无法从环境中解析出 policy 与 critic 观测，请检查 get_observations() 返回格式。")
+    return policy_obs, critic_obs
+
+
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
@@ -154,10 +210,10 @@ class OnPolicyRunner:
         self.use_tanh_output = train_cfg.get("use_tanh_output", False)
         self.device = device
         self.env = env
-        obs, extras = self.env.get_observations()
-        # Build per-group observation tensors expected by ActorCritic API
-        policy_obs_tensor = extras["observations"].get("policy", obs)
-        critic_obs_tensor = extras["observations"].get("critic", policy_obs_tensor)
+        # 按 key 区分 policy/critic，避免部署时 critic 误用 policy 张量（兼容 dict 或 (obs, extras) 两种返回格式）
+        policy_obs_tensor, critic_obs_tensor = _get_policy_critic_obs(self.env)
+        policy_obs_tensor = policy_obs_tensor.to(self.device)
+        critic_obs_tensor = critic_obs_tensor.to(self.device)
         num_obs = policy_obs_tensor.shape[1]
         num_critic_obs = critic_obs_tensor.shape[1]
 
@@ -317,10 +373,8 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs_tensor, extras = self.env.get_observations()
-        # build initial dict observation
-        policy_obs = extras["observations"].get("policy", obs_tensor)
-        critic_obs = extras["observations"].get("critic", policy_obs)
+        # 与 __init__ 一致：按 key 取 policy/critic，避免 critic 误用 policy 张量
+        policy_obs, critic_obs = _get_policy_critic_obs(self.env)
         obs = {"policy": policy_obs.to(self.device), "critic": critic_obs.to(self.device)}
         self.train_mode()  # switch to train mode (for dropout for example)
 
@@ -349,9 +403,12 @@ class OnPolicyRunner:
                         print(f"[train] iter={it} step0 env0 action(14) [raw policy]: {a0.tolist()}")
                     
                     obs_tensor, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    # rebuild dict observation from infos
-                    policy_obs = infos.get("observations", {}).get("policy", obs_tensor)
-                    critic_obs = infos.get("observations", {}).get("critic", policy_obs)
+                    # 从 infos 按 key 取 policy/critic，避免 critic 误用 policy；无 key 时用 obs_tensor 作为 fallback
+                    obs_dict = infos.get("observations", obs_tensor)
+                    if obs_dict is obs_tensor:
+                        obs_dict = {"policy": obs_tensor, "critic": obs_tensor}
+                    policy_obs = _ensure_obs_tensor(obs_dict, "policy", obs_tensor)
+                    critic_obs = _ensure_obs_tensor(obs_dict, "critic", obs_tensor)
                     obs = {"policy": policy_obs.to(self.device), "critic": critic_obs.to(self.device)}
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
                     # process the step - PPO.process_env_step expects (rewards, dones, infos)

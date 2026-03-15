@@ -3,6 +3,10 @@
 
 """Implementation of runners for environment-agent interaction."""
 
-from .on_policy_runner import OnPolicyRunner
+from .on_policy_runner import (
+    OnPolicyRunner,
+    _ensure_obs_tensor,
+    _get_policy_critic_obs,
+)
 
-__all__ = ["OnPolicyRunner"]
+__all__ = ["OnPolicyRunner", "_get_policy_critic_obs", "_ensure_obs_tensor"]
