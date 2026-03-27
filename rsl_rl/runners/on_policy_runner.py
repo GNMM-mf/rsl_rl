@@ -346,6 +346,63 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        # 课程学习 update：首次解析并缓存，避免每 iter import_module
+        self._cached_curriculum_update_fn = None
+        self._curriculum_fn_resolve_done = False
+
+    def _resolve_curriculum_update_fn(self, env_obj):
+        """Return update_curriculum_progress_per_iteration or None (resolve once)."""
+        task_module_path = None
+        if hasattr(env_obj, "cfg") and hasattr(env_obj.cfg, "__class__"):
+            cfg_module = env_obj.cfg.__class__.__module__
+            if "tasks." in cfg_module:
+                parts = cfg_module.split(".")
+                for i, part in enumerate(parts):
+                    if part == "tasks" and i + 1 < len(parts):
+                        task_name = parts[i + 1]
+                        task_module_path = f"isaacLab.manipulation.tasks.{task_name}.cart_control.mdp.curriculums"
+                        break
+
+        fallback_curriculum_modules = [
+            "isaacLab.manipulation.tasks.Cart_hands_trajcmd.cart_control.mdp.curriculums",
+            "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
+            "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
+            "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
+        ]
+        if task_module_path is None:
+            task_modules = list(fallback_curriculum_modules)
+        else:
+            task_modules = [task_module_path] + [m for m in fallback_curriculum_modules if m != task_module_path]
+            seen = set()
+            unique_task_modules = []
+            for m in task_modules:
+                if m not in seen:
+                    seen.add(m)
+                    unique_task_modules.append(m)
+            task_modules = unique_task_modules
+
+        for task_module in task_modules:
+            try:
+                curriculums_module = import_module(task_module)
+                if hasattr(curriculums_module, "update_curriculum_progress_per_iteration"):
+                    return getattr(curriculums_module, "update_curriculum_progress_per_iteration")
+            except (ImportError, AttributeError, ModuleNotFoundError):
+                continue
+        try:
+            from isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums import (
+                update_curriculum_progress_per_iteration,
+            )
+
+            return update_curriculum_progress_per_iteration
+        except (ImportError, AttributeError, ModuleNotFoundError):
+            return None
+
+    def _apply_curriculum_update(self, env_obj):
+        if not self._curriculum_fn_resolve_done:
+            self._cached_curriculum_update_fn = self._resolve_curriculum_update_fn(env_obj)
+            self._curriculum_fn_resolve_done = True
+        if self._cached_curriculum_update_fn is not None:
+            self._cached_curriculum_update_fn(env_obj)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -387,6 +444,8 @@ class OnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
+            if os.environ.get("RSL_RL_TRAIN_HEARTBEAT", "0") == "1":
+                print(f"[train heartbeat] iter {it}/{tot_iter - 1} rollout start", flush=True)
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -397,8 +456,13 @@ class OnPolicyRunner:
                     # PPO.act() expects (obs, critic_obs) as separate tensor arguments
                     actions = self.alg.act(policy_obs_tensor, critic_obs_tensor)
                     
-                    # 调试：打印的是策略网络原始输出（未限幅）；限幅在 CartControlAction.process_actions 中做，实际控制用的是限幅后的值
-                    if i == 0 and actions.shape[-1] >= 14 and it % 1 == 0:
+                    # 调试：默认关闭。每 iter 打印会海量写 stdout；SSH/无消费者时管道塞满后 print 阻塞，表现为长时间训练「卡死」无报错。
+                    # 需要时: RSL_RL_DEBUG_ACTION_PRINT=1 python ... train.py
+                    if (
+                        os.environ.get("RSL_RL_DEBUG_ACTION_PRINT", "0") == "1"
+                        and i == 0
+                        and actions.shape[-1] >= 14
+                    ):
                         a0 = actions[0, :14].detach().cpu().numpy()
                         print(f"[train] iter={it} step0 env0 action(14) [raw policy]: {a0.tolist()}")
                     
@@ -465,76 +529,10 @@ class OnPolicyRunner:
                 self.env.mean_episode_length = mean_ep_len
                 self.env.num_steps_per_env = self.num_steps_per_env  # 存储rollout长度（用于EMA alpha计算）
             
-            # 在每个iteration结束时更新课程学习的progress
-            # 这符合"课程学习 update 在 iteration，apply 在 reset"的设计原则
-            # 根据环境配置自动确定正确的任务模块路径
-            curriculum_updated = False
-            env_obj = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
-            
-            # 方法1：从环境配置类的模块路径推断任务模块
-            # 例如：isaacLab.manipulation.tasks.Cart_simplehands.cart_control.cart_control_env_cfg
-            # 提取任务名称：Cart_simplehands
-            task_module_path = None
-            if hasattr(env_obj, 'cfg') and hasattr(env_obj.cfg, '__class__'):
-                cfg_module = env_obj.cfg.__class__.__module__
-                # 从模块路径中提取任务名称
-                # 例如：isaacLab.manipulation.tasks.Cart_simplehands.cart_control.cart_control_env_cfg
-                # 提取：Cart_simplehands
-                if 'tasks.' in cfg_module:
-                    parts = cfg_module.split('.')
-                    for i, part in enumerate(parts):
-                        if part == 'tasks' and i + 1 < len(parts):
-                            task_name = parts[i + 1]  # 例如：Cart_simplehands
-                            # 构建课程学习模块路径
-                            task_module_path = f"isaacLab.manipulation.tasks.{task_name}.cart_control.mdp.curriculums"
-                            break
-            
-            # 方法2：如果方法1失败，尝试从已知的任务模块列表中查找
-            if task_module_path is None:
-                # 尝试从多个可能的路径导入课程学习函数（支持不同的任务变体）
-                task_modules = [
-                    "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
-                    "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
-                    "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
-                ]
-            else:
-                # 优先使用从配置推断的模块路径，然后尝试其他路径作为备选
-                task_modules = [task_module_path] + [
-                    "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
-                    "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
-                    "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
-                ]
-                # 去重，保持顺序
-                seen = set()
-                unique_task_modules = []
-                for m in task_modules:
-                    if m not in seen:
-                        seen.add(m)
-                        unique_task_modules.append(m)
-                task_modules = unique_task_modules
-            
-            # 尝试导入课程学习函数
-            for task_module in task_modules:
-                try:
-                    curriculums_module = import_module(task_module)
-                    if hasattr(curriculums_module, 'update_curriculum_progress_per_iteration'):
-                        update_curriculum_progress_per_iteration = getattr(curriculums_module, 'update_curriculum_progress_per_iteration')
-                        update_curriculum_progress_per_iteration(env_obj)
-                        curriculum_updated = True
-                        break
-                except (ImportError, AttributeError, ModuleNotFoundError):
-                    continue
-            
-            # 方法3：如果所有路径都失败，尝试通用导入（向后兼容）
-            if not curriculum_updated:
-                try:
-                    from isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums import update_curriculum_progress_per_iteration
-                    update_curriculum_progress_per_iteration(env_obj)
-                    curriculum_updated = True
-                except (ImportError, AttributeError, ModuleNotFoundError):
-                    # 如果课程学习函数不存在，跳过（兼容其他任务）
-                    pass
-            
+            # 在每个 iteration 结束时更新课程 progress（首次解析模块并缓存，避免每 iter import）
+            env_obj = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+            self._apply_curriculum_update(env_obj)
+
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
@@ -647,7 +645,9 @@ class OnPolicyRunner:
             f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n"""
         )
-        print(log_string)
+        print(log_string, flush=True)
+        if self.writer is not None and hasattr(self.writer, "flush"):
+            self.writer.flush()
 
     def save(self, path, infos=None):
         # Resolve actor-critic module (compat between newer/older PPO APIs)
