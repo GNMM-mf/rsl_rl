@@ -132,19 +132,20 @@ class RolloutStorage:
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        observations = self.observations.flatten(0, 1)
+        # 展平后显式 contiguous，避免后续 gather/index 路径触发低效访问。
+        observations = self.observations.flatten(0, 1).contiguous()
         if self.privileged_observations is not None:
-            critic_observations = self.privileged_observations.flatten(0, 1)
+            critic_observations = self.privileged_observations.flatten(0, 1).contiguous()
         else:
             critic_observations = observations
 
-        actions = self.actions.flatten(0, 1)
-        values = self.values.flatten(0, 1)
-        returns = self.returns.flatten(0, 1)
-        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
-        old_mu = self.mu.flatten(0, 1)
-        old_sigma = self.sigma.flatten(0, 1)
+        actions = self.actions.flatten(0, 1).contiguous()
+        values = self.values.flatten(0, 1).contiguous()
+        returns = self.returns.flatten(0, 1).contiguous()
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1).contiguous()
+        advantages = self.advantages.flatten(0, 1).contiguous()
+        old_mu = self.mu.flatten(0, 1).contiguous()
+        old_sigma = self.sigma.flatten(0, 1).contiguous()
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -152,15 +153,16 @@ class RolloutStorage:
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
 
-                obs_batch = observations[batch_idx]
-                critic_observations_batch = critic_observations[batch_idx]
-                actions_batch = actions[batch_idx]
-                target_values_batch = values[batch_idx]
-                returns_batch = returns[batch_idx]
-                old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
-                advantages_batch = advantages[batch_idx]
-                old_mu_batch = old_mu[batch_idx]
-                old_sigma_batch = old_sigma[batch_idx]
+                # 使用 index_select 替代高级索引，减少大 batch 下潜在的慢路径/不稳定性。
+                obs_batch = observations.index_select(0, batch_idx)
+                critic_observations_batch = critic_observations.index_select(0, batch_idx)
+                actions_batch = actions.index_select(0, batch_idx)
+                target_values_batch = values.index_select(0, batch_idx)
+                returns_batch = returns.index_select(0, batch_idx)
+                old_actions_log_prob_batch = old_actions_log_prob.index_select(0, batch_idx)
+                advantages_batch = advantages.index_select(0, batch_idx)
+                old_mu_batch = old_mu.index_select(0, batch_idx)
+                old_sigma_batch = old_sigma.index_select(0, batch_idx)
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
