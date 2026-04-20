@@ -453,8 +453,16 @@ class OnPolicyRunner:
                     # Extract policy and critic observations from dict
                     policy_obs_tensor = obs["policy"]
                     critic_obs_tensor = obs["critic"]
-                    # PPO.act() expects (obs, critic_obs) as separate tensor arguments
-                    actions = self.alg.act(policy_obs_tensor, critic_obs_tensor)
+                    # 与 get_inference_policy / test 脚本一致：policy 观测经 obs_normalizer 再进 actor。
+                    # 若不经过此处，rollout 从未调用 EmpiricalNormalization.forward，保存的 obs_norm_state_dict
+                    # 会永远停在初值 (mean=0,std=1)，且训练时 actor 吃的是「未归一化」观测，与部署/录包不一致。
+                    if self.empirical_normalization:
+                        with torch.no_grad():
+                            policy_obs_actor = self.obs_normalizer(policy_obs_tensor)
+                    else:
+                        policy_obs_actor = policy_obs_tensor
+                    # PPO.act() 首参为进入 actor 的观测（已归一化则与 ONNX 输入口径一致）
+                    actions = self.alg.act(policy_obs_actor, critic_obs_tensor)
                     
                     # 调试：默认关闭。每 iter 打印会海量写 stdout；SSH/无消费者时管道塞满后 print 阻塞，表现为长时间训练「卡死」无报错。
                     # 需要时: RSL_RL_DEBUG_ACTION_PRINT=1 python ... train.py
