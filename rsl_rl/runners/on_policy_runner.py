@@ -141,34 +141,89 @@ sys.modules["rsl_rl.algorithms.ppo"] = ppo_module
 spec_ppo.loader.exec_module(ppo_module)
 PPO = ppo_module.PPO
 
+try:
+    from tensordict import TensorDict as _ObservationTensorDict
+except ImportError:
+    _ObservationTensorDict = None  # type: ignore[misc, assignment]
+
+
+def _is_plain_observation_tensor(t) -> bool:
+    """与 ``nn.Linear`` 兼容的观测张量。
+
+    新版 ``tensordict.TensorDict`` 在部分 PyTorch 下为 Tensor 子类，``isinstance(td, torch.Tensor)`` 可能为真，
+    但绝不能整包传入 Actor；必须按 key 取出叶子张量。
+    """
+    if t is None:
+        return False
+    if _ObservationTensorDict is not None and isinstance(t, _ObservationTensorDict):
+        return False
+    return isinstance(t, torch.Tensor) and t.numel() > 0 and len(t.shape) >= 2
+
+
+def _maybe_unwrap_obs_container(x):
+    """将 ``step`` / ``get_observations`` 顶层的 TensorDict 转为 ``dict``；已是 dict 或普通张量则原样返回。"""
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if _ObservationTensorDict is not None and isinstance(x, _ObservationTensorDict):
+        return {k: x[k] for k in x.keys()}
+    # 无 tensordict 时 duck-type：带 batch_size 与 keys 的容器
+    if getattr(x, "batch_size", None) is not None and hasattr(x, "keys") and hasattr(x, "__getitem__"):
+        try:
+            return {k: x[k] for k in x.keys()}
+        except Exception:
+            pass
+    return x
+
 
 def _ensure_obs_tensor(obs, role_key: str, fallback: torch.Tensor = None):
     """从 dict/TensorDict/张量 中按 role_key 取出观测张量，保证 critic 不用 policy 的张量。
     role_key: "policy" 或 "critic"
     """
+    obs = _maybe_unwrap_obs_container(obs)
+
+    def _fallback_tensor(fb):
+        if fb is None:
+            return None
+        u = _maybe_unwrap_obs_container(fb)
+        if isinstance(u, dict):
+            t = u.get(role_key)
+            if t is None:
+                t = u.get("policy")
+            return t if _is_plain_observation_tensor(t) else None
+        return fb if _is_plain_observation_tensor(fb) else None
+
+    fb_tensor = _fallback_tensor(fallback)
+
     if obs is None:
-        return fallback
-    if isinstance(obs, torch.Tensor) and obs.numel() > 0 and len(obs.shape) >= 2:
+        return fb_tensor
+    if _is_plain_observation_tensor(obs):
         return obs
-    if hasattr(obs, "get") and role_key in obs:
+    if not isinstance(obs, dict):
+        return fb_tensor
+    if role_key in obs:
         val = obs[role_key]
-        if isinstance(val, torch.Tensor) and val.numel() > 0 and len(val.shape) >= 2:
+        if _is_plain_observation_tensor(val):
             return val
-    if hasattr(obs, "keys"):
-        for k in ("observations", "obs", "observation", "state"):
-            if k in obs:
-                sub = obs[k]
-                if hasattr(sub, "get") and role_key in sub:
-                    v = sub[role_key]
-                    if isinstance(v, torch.Tensor) and v.numel() > 0 and len(v.shape) >= 2:
-                        return v
-    return fallback
+    for k in ("observations", "obs", "observation", "state"):
+        if k not in obs:
+            continue
+        sub = _maybe_unwrap_obs_container(obs[k])
+        if isinstance(sub, dict) and role_key in sub:
+            v = sub[role_key]
+            if _is_plain_observation_tensor(v):
+                return v
+    return fb_tensor
 
 
 def _get_policy_critic_obs(env, get_observations_returns_dict: bool = None):
     """统一从环境获取 policy 与 critic 观测，保证两者按 key 区分，避免 critic 误用 policy 张量。
-    兼容两种 API：(1) get_observations() 返回 dict 且含 "policy"/"critic"；
-    (2) 返回 (obs, extras) 且 extras["observations"] 含 "policy"/"critic"。
+    兼容 API：
+    (1) dict，且含 "policy" / "critic"；
+    (2) tensordict.TensorDict（Isaac Lab 新版 RslRlVecEnvWrapper.get_observations），键同 dict；
+    (3) (obs_tensor, extras)，且 extras["observations"] 含 "policy"/"critic"；
+    (4) 更长 tuple：首元素为 obs，其中某一元素为含 observations 的 dict。
     返回 (policy_obs_tensor, critic_obs_tensor)，均为 2D tensor。
     """
     out = env.get_observations()
@@ -180,12 +235,37 @@ def _get_policy_critic_obs(env, get_observations_returns_dict: bool = None):
         policy_fallback = out.get("policy")
         critic_fallback = out.get("critic", out.get("policy"))
         obs_for_keys = out
-    else:
-        obs_tensor, extras = out
+    elif getattr(out, "batch_size", None) is not None and hasattr(out, "keys"):
+        # Isaac Lab RslRlVecEnvWrapper：get_observations() -> TensorDict(observation_manager.compute())
+        try:
+            obs_for_keys = {k: out[k] for k in out.keys()}
+        except Exception as e:
+            raise RuntimeError(
+                f"无法将 get_observations() 的 TensorDict 转为观测 dict: {type(out).__name__}: {e}"
+            ) from e
+        policy_fallback = obs_for_keys.get("policy")
+        critic_fallback = obs_for_keys.get("critic", policy_fallback)
+    elif isinstance(out, tuple):
+        if len(out) == 2:
+            obs_tensor, extras = out[0], out[1]
+        elif len(out) >= 3:
+            obs_tensor = out[0]
+            extras = {}
+            for item in reversed(out):
+                if isinstance(item, dict):
+                    extras = item
+                    break
+        else:
+            raise RuntimeError("get_observations() 返回空元组，无法解析 policy/critic 观测。")
         policy_fallback = obs_tensor
         critic_fallback = obs_tensor
         if isinstance(extras, dict) and "observations" in extras:
             obs_for_keys = extras["observations"]
+    else:
+        raise RuntimeError(
+            f"get_observations() 返回类型不受支持: {type(out)}。"
+            " 期望 dict、TensorDict（含 batch_size）或 (obs, extras) 元组。"
+        )
 
     policy_obs = _ensure_obs_tensor(obs_for_keys, "policy", policy_fallback)
     critic_obs = _ensure_obs_tensor(obs_for_keys, "critic", critic_fallback)
@@ -389,13 +469,20 @@ class OnPolicyRunner:
             except (ImportError, AttributeError, ModuleNotFoundError):
                 continue
         try:
-            from isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums import (
+            from isaacLab.manipulation.tasks.Cart_hands_trajcmd.cart_control.mdp.curriculums import (
                 update_curriculum_progress_per_iteration,
             )
 
             return update_curriculum_progress_per_iteration
         except (ImportError, AttributeError, ModuleNotFoundError):
-            return None
+            try:
+                from isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums import (
+                    update_curriculum_progress_per_iteration,
+                )
+
+                return update_curriculum_progress_per_iteration
+            except (ImportError, AttributeError, ModuleNotFoundError):
+                return None
 
     def _apply_curriculum_update(self, env_obj):
         if not self._curriculum_fn_resolve_done:
@@ -475,9 +562,14 @@ class OnPolicyRunner:
                         print(f"[train] iter={it} step0 env0 action(14) [raw policy]: {a0.tolist()}")
                     
                     obs_tensor, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    # 从 infos 按 key 取 policy/critic，避免 critic 误用 policy；无 key 时用 obs_tensor 作为 fallback
-                    obs_dict = infos.get("observations", obs_tensor)
-                    if obs_dict is obs_tensor:
+                    # 新版 RslRlVecEnvWrapper：obs_tensor 可能为 TensorDict；须解包后再喂 Actor（不能整包当 Tensor）
+                    obs_step = _maybe_unwrap_obs_container(obs_tensor)
+                    obs_dict = infos.get("observations", None)
+                    if obs_dict is not None:
+                        obs_dict = _maybe_unwrap_obs_container(obs_dict)
+                    elif isinstance(obs_step, dict):
+                        obs_dict = obs_step
+                    else:
                         obs_dict = {"policy": obs_tensor, "critic": obs_tensor}
                     policy_obs = _ensure_obs_tensor(obs_dict, "policy", obs_tensor)
                     critic_obs = _ensure_obs_tensor(obs_dict, "critic", obs_tensor)
