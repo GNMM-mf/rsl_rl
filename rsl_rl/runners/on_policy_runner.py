@@ -446,8 +446,8 @@ class OnPolicyRunner:
         fallback_curriculum_modules = [
             "isaacLab.manipulation.tasks.Cart_hands_trajcmd.cart_control.mdp.curriculums",
             "isaacLab.manipulation.tasks.Cart_hands.cart_control.mdp.curriculums",
-            "isaacLab.manipulation.tasks.Cart_simplehands.cart_control.mdp.curriculums",
-            "isaacLab.manipulation.tasks.Cart_dex3hands.cart_control.mdp.curriculums",
+            "isaacLab.manipulation.tasks.Cart_simplehands_trajcmd.cart_control.mdp.curriculums",
+            "isaacLab.manipulation.tasks.Cart_dex3hands_trajcmd.cart_control.mdp.curriculums",
         ]
         if task_module_path is None:
             task_modules = list(fallback_curriculum_modules)
